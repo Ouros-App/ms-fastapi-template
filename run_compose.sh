@@ -98,6 +98,10 @@ services:
       - .env
     ports:
       - "${porta}:8000"
+    volumes:
+      - ./app:/app/app
+      - ./requirements.txt:/app/requirements.txt:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped
 EOF
     echo $compose_file
@@ -126,7 +130,7 @@ buildar_e_subir() {
     # Build sem cache
     color_echo "blue" "🔨 Construindo imagem do zero (sem cache)..."
     (
-        docker-compose -f $compose_file build --no-cache --pull > /tmp/docker_build_${numero}.log 2>&1
+        docker compose -f $compose_file build --no-cache --pull > /tmp/docker_build_${numero}.log 2>&1
     ) &
     local build_pid=$!
     show_loading $build_pid "🔨 Build da imagem do zero (isso pode levar alguns minutos)"
@@ -144,7 +148,7 @@ buildar_e_subir() {
     # Subir container
     color_echo "blue" "🐳 Iniciando container com docker-compose..."
     (
-        docker-compose -f $compose_file up -d > /tmp/docker_compose_${numero}.log 2>&1
+        docker compose -f $compose_file up -d > /tmp/docker_compose_${numero}.log 2>&1
     ) &
     local up_pid=$!
     show_loading $up_pid "🐳 Subindo container"
@@ -171,7 +175,7 @@ buildar_e_subir() {
     if docker ps --format '{{.Names}}' | grep -q "^${nome}$"; then
         color_echo "green" "✓ Container está ativo e funcionando"
         color_echo "blue" "📊 Status:"
-        docker-compose -f $compose_file ps
+        docker compose -f $compose_file ps
     else
         color_echo "red" "❌ Container subiu mas caiu em seguida. Logs:"
         docker logs $nome --tail=30 2>&1
@@ -251,7 +255,7 @@ modo_reboot() {
     # Parar e remover container + imagem
     color_echo "blue" "🛑 Parando e removendo instância $NUMERO..."
     (
-        docker-compose -f $COMPOSE_FILE down --rmi local --volumes --remove-orphans > /dev/null 2>&1
+        docker compose -f $COMPOSE_FILE down --rmi local --volumes --remove-orphans > /dev/null 2>&1
     ) &
     local down_pid=$!
     show_loading $down_pid "🛑 Parando e removendo tudo"
@@ -272,6 +276,75 @@ modo_reboot() {
     buildar_e_subir "$NUMERO" "$PORTA_ATUAL"
 }
 
+modo_bind() {
+    local NUMERO=$1
+
+    echo ""
+    color_echo "cyan" "MODO BIND INSTANCIA #$NUMERO..."
+    echo ""
+
+    carregar_env
+
+    local NOME="${BASE_NAME}_${NUMERO}"
+
+    color_echo "blue" "Verificando instancia $NUMERO..."
+    if ! docker ps -a --format '{{.Names}}' | grep -q "^${NOME}$"; then
+        color_echo "red" "Instancia $NOME nao encontrada!"
+        exit 1
+    fi
+    color_echo "green" "Instancia encontrada"
+
+    local PORTA_ATUAL
+    PORTA_ATUAL=$(docker port $NOME 8000 2>/dev/null | cut -d ':' -f2)
+    if [ -z "$PORTA_ATUAL" ]; then
+        color_echo "yellow" "Nao foi possivel obter a porta atual, gerando nova porta..."
+        PORTA_ATUAL=$(proxima_porta_livre)
+    fi
+    color_echo "green" "Porta: $PORTA_ATUAL"
+
+    local COMPOSE_FILE
+    COMPOSE_FILE=$(gerar_compose_file "$NUMERO" "$PORTA_ATUAL" "$BASE_NAME")
+
+    export APP_PORT=$PORTA_ATUAL
+    export INSTANCE=$NUMERO
+    export APP_NAME=$BASE_NAME
+
+    color_echo "blue" "Parando instancia sem remover imagem..."
+    docker compose -f $COMPOSE_FILE stop > /tmp/docker_bind_${NUMERO}.log 2>&1
+
+    color_echo "blue" "Subindo instancia sem rebuild..."
+    docker compose -f $COMPOSE_FILE up -d --no-build >> /tmp/docker_bind_${NUMERO}.log 2>&1
+
+    if [ $? -ne 0 ]; then
+        color_echo "red" "Falha ao subir instancia em modo bind"
+        tail -10 /tmp/docker_bind_${NUMERO}.log
+        rm -f $COMPOSE_FILE /tmp/docker_bind_${NUMERO}.log
+        exit 1
+    fi
+
+    rm -f $COMPOSE_FILE /tmp/docker_bind_${NUMERO}.log
+
+    color_echo "green" "${NOME} iniciado sem rebuild"
+    color_echo "cyan" "Acesse: http://localhost:$PORTA_ATUAL"
+}
+
+show_help() {
+    echo "Uso: $0 [--rebuild [NUMERO] | --bind NUMERO]"
+    echo ""
+    echo "Opcoes:"
+    echo "  (sem argumentos)   Mesmo que --rebuild: builda e sobe nova instancia incremental"
+    echo "  --rebuild          Builda do zero e sobe nova instancia incremental"
+    echo "  --rebuild NUMERO   Para, remove e rebuilda a instancia informada"
+    echo "  --reboot NUMERO    Alias legado de --rebuild NUMERO"
+    echo "  --bind NUMERO      Para e sobe a instancia sem rebuild, usando bind mount"
+    echo "  -h, --help         Mostra esta ajuda"
+    echo ""
+    echo "Exemplos:"
+    echo "  $0"
+    echo "  $0 --rebuild 1"
+    echo "  $0 --bind 1"
+}
+
 # ─────────────────────────────────────────
 # Roteamento de argumentos
 # ─────────────────────────────────────────
@@ -279,12 +352,29 @@ modo_reboot() {
 if [ $# -eq 0 ]; then
     modo_novo
 
+elif [ $# -eq 1 ] && [ "$1" = "--rebuild" ]; then
+    modo_novo
+
+elif [ $# -eq 2 ] && [ "$1" = "--rebuild" ]; then
+    if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+        color_echo "red" "Numero invalido: $2"
+        exit 1
+    fi
+    modo_reboot "$2"
+
 elif [ $# -eq 2 ] && [ "$1" = "--reboot" ]; then
     if ! [[ "$2" =~ ^[0-9]+$ ]]; then
         color_echo "red" "❌ Número inválido: $2"
         exit 1
     fi
     modo_reboot "$2"
+
+elif [ $# -eq 2 ] && [ "$1" = "--bind" ]; then
+    if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+        color_echo "red" "Numero invalido: $2"
+        exit 1
+    fi
+    modo_bind "$2"
 
 elif [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     show_help

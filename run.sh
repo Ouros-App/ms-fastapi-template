@@ -1,294 +1,260 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# run.sh
+# Uso:
+#   ./run.sh              cria novo container APP_NAME_N
+#   ./run.sh --reboot N   rebuilda e recria APP_NAME_N preservando a porta se possível
+#   ./run.sh --remove N   remove APP_NAME_N
+#   ./run.sh --list       lista containers do app
 
-# Função para mostrar loading
-show_loading() {
-    local pid=$1
-    local message=$2
-    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    local i=0
-    
-    while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) % ${#spin} ))
-        printf "\r%s ${spin:$i:1}" "$message"
-        sleep 0.1
-    done
-    printf "\r"
+set -Eeuo pipefail
+
+# ==========================================
+# Config
+# ==========================================
+
+APP_PORT="${APP_PORT:-8000}"
+BUILD_LOG="${BUILD_LOG:-./docker-build.log}"
+
+# Usa docker direto se o usuário tiver permissão.
+# Caso contrário, usa sudo docker.
+if docker info >/dev/null 2>&1; then
+    DOCKER=(docker)
+else
+    DOCKER=(sudo docker)
+fi
+
+# ==========================================
+# Funções auxiliares
+# ==========================================
+
+die() {
+    echo "❌ $*" >&2
+    exit 1
 }
 
-# Função para feedback colorido
-color_echo() {
-    local color=$1
-    local message=$2
-    case $color in
-        "green") echo -e "\033[0;32m$message\033[0m" ;;
-        "red") echo -e "\033[0;31m$message\033[0m" ;;
-        "yellow") echo -e "\033[1;33m$message\033[0m" ;;
-        "blue") echo -e "\033[0;34m$message\033[0m" ;;
-        "cyan") echo -e "\033[0;36m$message\033[0m" ;;
-        *) echo "$message" ;;
-    esac
+source_env() {
+    [[ -f .env ]] || die "Arquivo .env não encontrado"
+
+    set -a
+    source .env
+    set +a
+
+    [[ -n "${APP_NAME:-}" ]] || die "APP_NAME não definido no .env"
 }
 
-# Help
-show_help() {
-    echo "Uso: $0 [--reboot NUMERO]"
-    echo ""
-    echo "Opções:"
-    echo "  (sem argumentos)   Builda a imagem e sobe um novo container com número incremental"
-    echo "  --reboot NUMERO    Para, remove e rebuilda o container com o número especificado"
-    echo "  -h, --help         Mostra esta ajuda"
-    echo ""
-    echo "Exemplos:"
-    echo "  $0                 # Sobe novo container (ex: minha_app_1, minha_app_2, ...)"
-    echo "  $0 --reboot 1      # Rebuilda do zero o container minha_app_1"
+container_name() {
+    echo "${APP_NAME}_$1"
 }
 
-# ─────────────────────────────────────────
-# Funções principais
-# ─────────────────────────────────────────
+image_name() {
+    echo "${APP_NAME}:$1"
+}
 
-carregar_env() {
-    color_echo "blue" "📁 Verificando configurações..."
-    if [ ! -f .env ]; then
-        color_echo "red" "❌ Arquivo .env não encontrado!"
-        exit 1
+porta_em_uso() {
+    local porta="$1"
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn | awk '{print $4}' | grep -qE "[:.]${porta}$"
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -i :"$porta" >/dev/null 2>&1
+    else
+        "${DOCKER[@]}" ps --format '{{.Ports}}' | grep -q ":${porta}->"
     fi
-
-    # Parser seguro: só aceita linhas no formato CHAVE=VALOR, ignora comentários e texto solto
-    while IFS='=' read -r key value; do
-        # Pular linhas vazias, comentários e linhas sem '=' (texto solto)
-        [[ -z "$key" || "$key" =~ ^[[:space:]]*# || ! "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && continue
-        # Remover aspas do valor se existirem
-        value="${value%\"}"
-        value="${value#\"}"
-        value="${value%\'}"
-        value="${value#\'}"
-        export "$key=$value"
-    done < .env
-
-    if [ -z "$APP_NAME" ]; then
-        color_echo "red" "❌ APP_NAME não encontrado no .env"
-        exit 1
-    fi
-
-    BASE_NAME="$APP_NAME"
-    color_echo "green" "✓ APP_NAME: $BASE_NAME"
-    color_echo "green" "✓ Variáveis carregadas: APP_NAME=$APP_NAME, APP_PORT=${APP_PORT:-8000}"
 }
 
 proxima_porta_livre() {
-    local porta=$((RANDOM % 9000 + 1000))
-    while lsof -i :$porta &>/dev/null; do
-        porta=$((RANDOM % 9000 + 1000))
-    done
-    echo $porta
-}
+    local porta
 
-buildar_imagem() {
-    local nome=$1
-    color_echo "blue" "🧹 Limpando cache de build..."
-    (
-        docker builder prune -f > /dev/null 2>&1
-    ) &
-    show_loading $! "🧹 Limpando cache"
-    wait $!
-    color_echo "green" "✓ Cache limpo"
+    for _ in {1..100}; do
+        porta=$((RANDOM % 50000 + 10000))
 
-    color_echo "blue" "🏗️ Construindo imagem $nome (sem cache, do zero)..."
-    (
-        docker build --no-cache --pull \
-                     --build-arg APP_NAME=$APP_NAME \
-                     --build-arg APP_PORT=${APP_PORT:-8000} \
-                     -t $nome . > /tmp/docker_build_${nome}.log 2>&1
-    ) &
-    local build_pid=$!
-    show_loading $build_pid "🏗️ Construindo imagem do zero (isso pode levar alguns minutos)"
-    wait $build_pid
-
-    if [ $? -eq 0 ]; then
-        color_echo "green" "✓ Imagem construída com sucesso"
-    else
-        color_echo "red" "❌ Falha na construção da imagem"
-        color_echo "yellow" "📋 Últimas linhas do log de build:"
-        tail -10 /tmp/docker_build_${nome}.log
-        rm -f /tmp/docker_build_${nome}.log
-        exit 1
-    fi
-    rm -f /tmp/docker_build_${nome}.log
-}
-
-subir_container() {
-    local nome=$1
-    local porta=$2
-
-    color_echo "blue" "🐳 Iniciando container $nome na porta $porta..."
-
-    local args=("-d" "-p" "${porta}:8000" "--name" "$nome")
-    
-    while IFS='=' read -r key value; do
-        [[ -z "$key" || "$key" =~ ^[[:space:]]*# || ! "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && continue
-        if [[ "$key" != "APP_NAME" && "$key" != "APP_PORT" ]]; then
-            value="${value%\"}"
-            value="${value#\"}"
-            value="${value%\'}"
-            value="${value#\'}"
-            args+=("-e" "${key}=${value}")
+        if ! porta_em_uso "$porta"; then
+            echo "$porta"
+            return 0
         fi
-    done < .env
-    
-    args+=("$nome")
-    
-    color_echo "yellow" "📝 Executando docker run com ${#args[@]} argumentos"
-    
-    docker run "${args[@]}"
+    done
+
+    die "Não consegui encontrar uma porta livre"
 }
 
-verificar_status() {
-    local nome=$1
-    local porta=$2
+porta_do_container() {
+    local nome="$1"
 
-    echo ""
-    color_echo "green" "✅ $nome iniciado na porta $porta"
-    color_echo "cyan" "🌐 Acesse: http://localhost:$porta"
-    echo ""
+    "${DOCKER[@]}" port "$nome" "$APP_PORT/tcp" 2>/dev/null \
+        | head -n1 \
+        | sed -E 's/.*:([0-9]+)$/\1/'
+}
 
-    # Aguardar 2s para o container estabilizar antes de verificar
-    sleep 2
+proximo_numero() {
+    local num=1
 
-    if docker ps --format '{{.Names}}' | grep -q "^${nome}$"; then
-        color_echo "green" "✓ Container está ativo e funcionando"
-        color_echo "blue" "📋 Variáveis de ambiente carregadas do .env:"
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# || ! "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && continue
-            if [[ "$key" != "APP_NAME" && "$key" != "APP_PORT" ]]; then
-                color_echo "yellow" "   - $key"
-            fi
-        done < .env
-    else
-        color_echo "red" "❌ Container subiu mas caiu em seguida. Logs:"
-        docker logs $nome --tail=30 2>&1
-        color_echo "yellow" "⚠️ Verifique os logs acima para identificar o erro."
+    while "${DOCKER[@]}" ps -a --format '{{.Names}}' | grep -qx "${APP_NAME}_${num}"; do
+        num=$((num + 1))
+    done
+
+    echo "$num"
+}
+
+container_existe() {
+    local nome="$1"
+
+    "${DOCKER[@]}" ps -a --format '{{.Names}}' | grep -qx "$nome"
+}
+
+container_rodando() {
+    local nome="$1"
+
+    "${DOCKER[@]}" ps --format '{{.Names}}' | grep -qx "$nome"
+}
+
+build_image() {
+    local imagem="$1"
+
+    echo "🏗️ Build da imagem: $imagem"
+
+    if ! "${DOCKER[@]}" build --pull --no-cache -t "$imagem" . > "$BUILD_LOG" 2>&1; then
+        echo "❌ Build falhou. Últimas linhas:"
+        tail -40 "$BUILD_LOG"
         exit 1
     fi
-
-    echo ""
-    color_echo "green" "✨ Concluído com sucesso!"
 }
 
-# ─────────────────────────────────────────
-# Modo: NOVO container incremental
-# ─────────────────────────────────────────
+remove_container() {
+    local nome="$1"
+
+    if container_existe "$nome"; then
+        echo "🧹 Removendo container antigo: $nome"
+        "${DOCKER[@]}" rm -f "$nome" >/dev/null
+    else
+        echo "ℹ️ Container não existe: $nome"
+    fi
+}
+
+run_container() {
+    local nome="$1"
+    local imagem="$2"
+    local porta="$3"
+
+    echo "🐳 Subindo container: $nome"
+    echo "🌐 Porta: $porta -> $APP_PORT"
+
+    "${DOCKER[@]}" run -d \
+        --name "$nome" \
+        --restart unless-stopped \
+        --env-file .env \
+        -p "${porta}:${APP_PORT}" \
+        "$imagem" >/dev/null
+
+    echo "✅ Rodando: http://localhost:$porta"
+}
+
+# ==========================================
+# Modos
+# ==========================================
 
 modo_novo() {
-    echo ""
-    color_echo "cyan" "🚀 SUBINDO NOVO CONTAINER..."
-    echo ""
+    source_env
 
-    carregar_env
+    local numero nome imagem porta
 
-    # Descobrir próximo número disponível
-    local numero=1
-    while docker ps -a --format '{{.Names}}' | grep -q "^${BASE_NAME}_${numero}$"; do
-        numero=$((numero + 1))
-    done
-    color_echo "green" "✓ Próximo número disponível: $numero"
+    numero="$(proximo_numero)"
+    nome="$(container_name "$numero")"
+    imagem="$(image_name "$numero")"
+    porta="$(proxima_porta_livre)"
 
-    local nome="${BASE_NAME}_${numero}"
-    local porta
-    porta=$(proxima_porta_livre)
-    color_echo "green" "✓ Porta disponível: $porta"
+    echo "🚀 Novo container: $nome"
 
-    buildar_imagem "$nome"
-    subir_container "$nome" "$porta"
-    verificar_status "$nome" "$porta"
+    build_image "$imagem"
+    run_container "$nome" "$imagem" "$porta"
 }
-
-# ─────────────────────────────────────────
-# Modo: REBOOT de container existente
-# ─────────────────────────────────────────
 
 modo_reboot() {
-    local NUMERO=$1
+    local numero="$1"
 
-    echo ""
-    color_echo "cyan" "🔄 REINICIANDO CONTAINER #$NUMERO..."
-    echo ""
+    source_env
 
-    carregar_env
+    local nome imagem porta_antiga porta_nova porta_final
 
-    local NOME="${BASE_NAME}_${NUMERO}"
+    nome="$(container_name "$numero")"
+    imagem="$(image_name "$numero")"
 
-    # Verificar se o container existe
-    color_echo "blue" "🔍 Verificando se o container $NOME existe..."
-    if ! docker ps -a --format '{{.Names}}' | grep -q "^${NOME}$"; then
-        color_echo "red" "❌ Container $NOME não encontrado!"
-        exit 1
+    echo "🔄 Atualizando container: $nome"
+
+    porta_antiga="$(porta_do_container "$nome" || true)"
+
+    if [[ -n "${porta_antiga:-}" ]]; then
+        porta_final="$porta_antiga"
+        echo "📌 Preservando porta antiga: $porta_final"
+    else
+        porta_final="$(proxima_porta_livre)"
+        echo "📌 Usando nova porta: $porta_final"
     fi
-    color_echo "green" "✓ Container encontrado"
 
-    # Obter porta atual
-    local PORTA_ATUAL
-    PORTA_ATUAL=$(docker port $NOME 8000 2>/dev/null | cut -d ':' -f2)
-    if [ -z "$PORTA_ATUAL" ]; then
-        color_echo "yellow" "⚠️ Não foi possível obter a porta atual, gerando nova porta..."
-        PORTA_ATUAL=$(proxima_porta_livre)
-    fi
-    color_echo "green" "✓ Porta: $PORTA_ATUAL"
+    remove_container "$nome"
 
-    # Parar container
-    color_echo "blue" "🛑 Parando container $NOME..."
-    (
-        docker stop $NOME > /dev/null 2>&1
-    ) &
-    local stop_pid=$!
-    show_loading $stop_pid "🛑 Parando container"
-    wait $stop_pid
-    color_echo "green" "✓ Container parado"
+    echo "🗑️ Removendo imagem antiga, se existir..."
+    "${DOCKER[@]}" rmi -f "$imagem" >/dev/null 2>&1 || true
 
-    # Remover container
-    color_echo "blue" "🗑️ Removendo container $NOME..."
-    (
-        docker rm -f $NOME > /dev/null 2>&1
-    ) &
-    local rm_pid=$!
-    show_loading $rm_pid "🗑️ Removendo container"
-    wait $rm_pid
-    color_echo "green" "✓ Container removido"
-
-    # Remover imagem antiga
-    color_echo "blue" "🗑️ Removendo imagem antiga do $NOME..."
-    (
-        docker rmi -f $NOME > /dev/null 2>&1
-        docker image prune -f > /dev/null 2>&1
-    ) &
-    local rmi_pid=$!
-    show_loading $rmi_pid "🗑️ Removendo imagem"
-    wait $rmi_pid
-    color_echo "green" "✓ Imagem removida"
-
-    buildar_imagem "$NOME"
-    subir_container "$NOME" "$PORTA_ATUAL"
-    verificar_status "$NOME" "$PORTA_ATUAL"
+    build_image "$imagem"
+    run_container "$nome" "$imagem" "$porta_final"
 }
 
-# ─────────────────────────────────────────
-# Roteamento de argumentos
-# ─────────────────────────────────────────
+modo_remove() {
+    local numero="$1"
 
-if [ $# -eq 0 ]; then
-    modo_novo
+    source_env
 
-elif [ $# -eq 2 ] && [ "$1" = "--reboot" ]; then
-    if ! [[ "$2" =~ ^[0-9]+$ ]]; then
-        color_echo "red" "❌ Número inválido: $2"
+    local nome imagem
+
+    nome="$(container_name "$numero")"
+    imagem="$(image_name "$numero")"
+
+    remove_container "$nome"
+
+    echo "🗑️ Removendo imagem: $imagem"
+    "${DOCKER[@]}" rmi -f "$imagem" >/dev/null 2>&1 || true
+
+    echo "✅ Removido: $nome"
+}
+
+modo_list() {
+    source_env
+
+    echo "📦 Containers de $APP_NAME:"
+    "${DOCKER[@]}" ps -a \
+        --filter "name=^/${APP_NAME}_[0-9]+$" \
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'
+}
+
+# ==========================================
+# Main
+# ==========================================
+
+case "${1:-}" in
+    "")
+        modo_novo
+        ;;
+
+    --reboot)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "Uso: $0 --reboot NUMERO"
+        modo_reboot "$2"
+        ;;
+
+    --remove)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "Uso: $0 --remove NUMERO"
+        modo_remove "$2"
+        ;;
+
+    --list)
+        modo_list
+        ;;
+
+    *)
+        echo "Uso:"
+        echo "  $0              cria novo container"
+        echo "  $0 --reboot N   rebuilda e recria container N"
+        echo "  $0 --remove N   remove container N"
+        echo "  $0 --list       lista containers do app"
         exit 1
-    fi
-    modo_reboot "$2"
-
-elif [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    show_help
-
-else
-    show_help
-    exit 1
-fi
+        ;;
+esac
