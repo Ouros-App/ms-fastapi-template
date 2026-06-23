@@ -1,4 +1,5 @@
 # FastAPI Microservice Template
+teste qualquer coisa
 
 Template minimo para iniciar um microservico com FastAPI.
 
